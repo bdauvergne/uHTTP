@@ -10,7 +10,8 @@ keywords = ["asgi", "web", "http"]
 
 [tool.poetry.dependencies]
 python = "^3.9"
-
+python-multipart = "^0.0.6"
+ijson = "^3.2.3"
 
 [build-system]
 requires = ["poetry-core"]

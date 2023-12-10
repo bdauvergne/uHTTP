@@ -1,10 +1,11 @@
 """µHTTP - ASGI micro framework"""
 
 import re
+import ijson
 import json
 from http import HTTPStatus
 from http.cookies import SimpleCookie, CookieError
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qsl, unquote
 from unicodedata import normalize
 from asyncio import to_thread
 from inspect import iscoroutinefunction
@@ -265,8 +266,8 @@ class App:
             request = Request(
                 method=scope['method'],
                 path=scope['path'],
-                args=parse_qs(unquote(scope['query_string'])),
-                state=scope['state'].copy()
+                args=parse_qsl(unquote(scope['query_string'])),
+                state=dict(scope.get('state', {})),
             )
 
             try:
@@ -283,25 +284,46 @@ class App:
                 except CookieError:
                     raise Response(400)
 
-                while True:
-                    event = await receive()
-                    request.body += event['body']
-                    if len(request.body) > self._max_content:
-                        raise Response(413)
-                    if not event['more_body']:
-                        break
-
                 content_type = request.headers.get('content-type', '')
                 if 'application/json' in content_type:
+                    class Body:
+                        def __init__(self, receive):
+                            self.receive = receive
+                            self.buffer = b''
+                            self.finished = False
+
+                        async def read(self, n=-1):
+                            if n == 0:
+                                return b''
+
+                            if not self.finished:
+                                while len(self.buffer) == 0:
+                                    event = await receive()
+                                    self.buffer += event['body']
+                                    if not event.get('more_body'):
+                                        self.finished = True
+                            result = self.buffer
+                            if n > 0:
+                                self.buffer = result[n:]
+                                result = result[:n]
+                            return result
                     try:
-                        request.json = await to_thread(
-                            json.loads, request.body.decode()
-                        )
-                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        async for json in ijson.items(Body(receive), ''):
+                            request.json = json
+                    except (UnicodeDecodeError, ijson.JSONError):
                         raise Response(400)
                 elif 'application/x-www-form-urlencoded' in content_type:
+
+                    while True:
+                        event = await receive()
+                        request.body += event['body']
+                        if len(request.body) > self._max_content:
+                            raise HTTPException(413)
+                        if not event.get('more_body'):
+                            break
+
                     request.form = await to_thread(
-                        parse_qs, unquote(request.body)
+                        parse_qsl, unquote(request.body)
                     )
 
                 for func in self._before:
