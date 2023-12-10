@@ -9,6 +9,8 @@ from urllib.parse import parse_qsl, unquote
 from unicodedata import normalize
 from asyncio import to_thread
 from inspect import iscoroutinefunction
+import multipart
+from multipart.multipart import parse_options_header
 
 
 async def asyncfy(func, /, *args, **kwargs):
@@ -82,6 +84,50 @@ class MultiDict(dict):
         super().update(MultiDict(new))
 
 
+class Headers(MultiDict):
+    def __init__(self, mapping=None):
+        if mapping is None:
+            super().__init__()
+        elif isinstance(mapping, MultiDict):
+            super().__init__({k.lower(): v[:] for k, v in mapping.itemslist()})
+        elif isinstance(mapping, dict):
+            super().__init__({
+                k.lower(): [v] if not isinstance(v, list) else v[:]
+                for k, v in mapping.items()
+            })
+        elif isinstance(mapping, (tuple, list)):
+            super().__init__()
+            for key, value in mapping:
+                self._setdefault(key, []).append(value)
+        else:
+            raise TypeError('Invalid mapping type')
+
+    def __getitem__(self, key):
+        return super().__getitem__(key.lower())[-1]
+
+    def __setitem__(self, key, value):
+        super().setdefault(key.lower(), []).append(value)
+
+    def _get(self, key, default=(None,)):
+        return super().get(key.lower(), list(default))
+
+    def get(self, key, default=None):
+        return super().get(key.lower(), [default])[-1]
+
+    def _pop(self, key, default=(None,)):
+        return super().pop(key.lower(), list(default))
+
+    def pop(self, key, default=None):
+        values = super().get(key.lower(), [])
+        return values.pop() if len(values) > 1 else super().pop(key.lower(), default)
+
+    def _setdefault(self, key, default=(None,)):
+        return super().setdefault(key.lower(), list(default))
+
+    def setdefault(self, key, default=None):
+        return super().setdefault(key.lower(), [default])[-1]
+
+
 class Request:
     def __init__(
         self,
@@ -101,7 +147,7 @@ class Request:
         self.path = path
         self.params = params or {}
         self.args = MultiDict(args)
-        self.headers = MultiDict(headers)
+        self.headers = Headers(headers)
         self.cookies = SimpleCookie(cookies)
         self.body = body
         self.json = json or {}
@@ -150,6 +196,29 @@ class Response(Exception):
             return cls(status=204)
         else:
             raise TypeError
+
+
+class Body:
+    def __init__(self, receive):
+        self.receive = receive
+        self.buffer = b''
+        self.finished = False
+
+    async def read(self, n=-1):
+        if n == 0:
+            return b''
+
+        if not self.finished:
+            while len(self.buffer) == 0:
+                event = await self.receive()
+                self.buffer += event['body']
+                if not event.get('more_body'):
+                    self.finished = True
+        result = self.buffer
+        if n > 0:
+            self.buffer = result[n:]
+            result = result[:n]
+        return result
 
 
 class App:
@@ -270,9 +339,10 @@ class App:
                 state=dict(scope.get('state', {})),
             )
 
+
             try:
                 try:
-                    request.headers = MultiDict([
+                    request.headers = Headers([
                         [k.decode('ascii'), normalize('NFC', v.decode())]
                         for k, v in scope['headers']
                     ])
@@ -284,47 +354,29 @@ class App:
                 except CookieError:
                     raise Response(400)
 
-                content_type = request.headers.get('content-type', '')
-                if 'application/json' in content_type:
-                    class Body:
-                        def __init__(self, receive):
-                            self.receive = receive
-                            self.buffer = b''
-                            self.finished = False
-
-                        async def read(self, n=-1):
-                            if n == 0:
-                                return b''
-
-                            if not self.finished:
-                                while len(self.buffer) == 0:
-                                    event = await receive()
-                                    self.buffer += event['body']
-                                    if not event.get('more_body'):
-                                        self.finished = True
-                            result = self.buffer
-                            if n > 0:
-                                self.buffer = result[n:]
-                                result = result[:n]
-                            return result
+                content_type, params = parse_options_header(request.headers.get('content-type', ''))
+                if content_type.split(b'+')[0] == b'application/json':
                     try:
                         async for json in ijson.items(Body(receive), ''):
                             request.json = json
                     except (UnicodeDecodeError, ijson.JSONError):
                         raise Response(400)
-                elif 'application/x-www-form-urlencoded' in content_type:
+                elif content_type in (b'application/x-www-form-urlencoded', b'multipart/form-data'):
+                    request.form = form = MultiDict()
+                    def on_field(field):
+                        form[field.field_name.decode()] = field.value.decode()
+                    def on_file(file):
+                        form[file.field_name.decode()] = file
 
+                    form_parser = multipart.multipart.create_form_parser(request.headers, on_field, on_file)
                     while True:
                         event = await receive()
-                        request.body += event['body']
+                        form_parser.write(event['body'])
                         if len(request.body) > self._max_content:
                             raise HTTPException(413)
                         if not event.get('more_body'):
                             break
-
-                    request.form = await to_thread(
-                        parse_qsl, unquote(request.body)
-                    )
+                    form_parser.finalize()
 
                 for func in self._before:
                     if ret := await asyncfy(func, request):
